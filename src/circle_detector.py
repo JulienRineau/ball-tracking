@@ -1,54 +1,53 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 
 import numpy as np
 import cv2 as cv
-import rospkg
 import rospy
-from tracking.msg import circle
-from tracking.msg import circles
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 import imutils
+from collections import deque
+from std_msgs.msg import String
 
-class Circle_Detector:
-	def __init__(self,pub_topic="circle",radMin=30,radMax=120):
+
+class BallDetector:
+	def __init__(self,pub_topic="ball_coord"):
+		self.buffer = 64
 		self.pub_topic = pub_topic
-		self.radMin = radMin
-		self.radMax = radMax
 		self.rate = rospy.Rate(120) #3Hz
-		self.circleData = circle()
-		self.circleArray = circles()
 		self.bridge = CvBridge()
-
+		self.pts = deque(maxlen=self.buffer)
+		
 	def detection(self,topic,display=True):
-		#rospy.init_node(self.pub_topic+'_node', anonymous=True)
 		self.display = display
-		self.circle_pub = rospy.Publisher(self.pub_topic, circles, queue_size=50)
+		self.str_pub = rospy.Publisher('string_pub', String, queue_size=10)
 		self.img_pub = rospy.Publisher('circle_visualization', Image, queue_size=50)
-		self.subscription_pub = rospy.Publisher('subscription', Image, queue_size=50)
-		self.mask_pub = rospy.Publisher('mask', Image, queue_size=50)
 		print("detection starting")
 		rospy.Subscriber(topic, Image, self.trackerCallback)
 		print("subscriber launched")
 	
-	def draw_circle(self, img, list):
-		for cx, cy, radius in list:
-			#draw circle
-			cv.circle(img, (cx, cy), (int)(radius), (0,255,255), 10)
-		ros_msg = self.bridge.cv2_to_imgmsg(img, "8UC3")
-		self.img_pub.publish(ros_msg)
-  
+	def draw_circle(self, img, x, y, radius):
+     	# loop over the set of tracked points
+		for i in range(1, len(self.pts)):
+			# if either of the tracked points are None, ignore
+			# them
+			if self.pts[i - 1] is None or self.pts[i] is None:
+				continue
+			# otherwise, compute the thickness of the line and
+			# draw the connecting lines
+			thickness = int(np.sqrt(self.buffer / float(i + 1)) * 2.5)
+			cv.line(img, self.pts[i - 1], self.pts[i], (0, 0, 255), thickness)
 
+		# draw the circle and center of the shape on the image
+		cv.circle(img, (int(x), int(y)), int(radius),(0, 255, 255), 2)
+		cv.circle(img, (int(x), int(y)), 7, (255, 255, 255), -1)
+		cv.putText(img, "center", (x - 20, y - 20),
+			cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+		img_msg = self.bridge.cv2_to_imgmsg(img, "8UC3")
+		self.img_pub.publish(img_msg)
   
 	def trackerCallback(self, ros_msg):
-		"""Publish the position and size of the detected circles
-
-		Parameters
-		----------
-		first : ros_msg (sensor_msgs.msg Image)
-			Ros image from the video
-		"""
-		#print(ros_msg)
 		try:
 			img = self.bridge.imgmsg_to_cv2(ros_msg, "8UC3")
 		except CvBridgeError as e:
@@ -57,78 +56,40 @@ class Circle_Detector:
 
 		#convert to hsv
 		hsv = cv.cvtColor(img, cv.COLOR_BGR2HSV)
-
-		blur = cv.GaussianBlur(hsv, (5, 5), cv.BORDER_DEFAULT)
+		blur = cv.GaussianBlur(hsv, (7, 7), cv.BORDER_DEFAULT)
   
-		## mask of orange 
+		# mask of orange 
 		mask = cv.inRange(blur, (10, 150, 150), (20, 255,255))
+		mask = cv.erode(mask, None, iterations=2)
+		mask = cv.dilate(mask, None, iterations=2)
 		orange = cv.bitwise_and(blur, blur, mask=mask)
-		## slice the orange
-		# imask = mask>0
-		# orange = np.zeros_like(img, np.uint8)
-		# orange[imask] = img[imask]
   
+		# find contours in the thresholded image		
 		gray = cv.cvtColor(orange, cv.COLOR_BGR2GRAY)
-  
-		
-  
-		# find contours in the thresholded image
 		cnts = cv.findContours(gray.copy(), cv.RETR_EXTERNAL,
 			cv.CHAIN_APPROX_SIMPLE)
-
 		cnts = imutils.grab_contours(cnts)
-		# loop over the contours
-		for c in cnts:
-			# compute the center of the contour
-			M = cv.moments(c)
-			if M["m00"] != 0:
-				cX = int(M["m10"] / M["m00"])
-				cY = int(M["m01"] / M["m00"])
-			else:
-				# set values as what you need in the situation
-				cX, cY = 0, 0
+
+		if cnts:
+			c = max(cnts, key=cv.contourArea)
+			((x, y), radius) = cv.minEnclosingCircle(c)
     
-			# draw the contour and center of the shape on the image
-			cv.drawContours(img, [c], -1, (0, 255, 0), 2)
-			cv.circle(img, (cX, cY), 7, (255, 255, 255), -1)
-			cv.putText(img, "center", (cX - 20, cY - 20),
-				cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-		mask_msg = self.bridge.cv2_to_imgmsg(orange, "8UC3")
-		circle_msg = self.bridge.cv2_to_imgmsg(img, "8UC3")
-		self.mask_pub.publish(mask_msg)
-		self.img_pub.publish(circle_msg)
-		print('publishing')
-
-		#convert to grayscale
-		# gray = cv.cvtColor(orange, cv.COLOR_BGR2GRAY)
-		# rows = gray.shape[0]
-  
-		# #blur to remove noise
-		# blur = cv.GaussianBlur(gray, (5, 5), cv.BORDER_DEFAULT)
+			x = round((x-404)/19.3,2)
+			y = round((y-226)/18.8,2)
+			radius = int(radius)
+			self.str_pub.publish(str(x) + ' ' + str(y) + ' ' + str(radius))
+   			
+      		# update the points queue
+			self.pts.appendleft((int(x),int(y)))
+   
+		if self.display:
+			self.draw_circle(img, x, y, radius)
 		
-  		# #circle detection
-		# hough = cv.HoughCircles(blur, cv.HOUGH_GRADIENT, 1, rows / 8, param1=40, param2=30, minRadius=30, maxRadius=120)
+		self.img_pub.publish(self.bridge.cv2_to_imgmsg(img, "8UC3"))
 
-		# ensure at least some circles were found
-		# circle_to_draw = []
-		# if hough is not None:
-		# 	print("Hough detection")
-		# 	# convert the (x, y) coordinates and radius of the circles to integers
-		# 	hough = np.round(hough[0, :]).astype("int")
-		# 	for x, y, r in hough:
-		# 		self.circleData.x = x
-		# 		self.circleData.y = y
-		# 		self.circleData.radius = r
-		# 		self.circleArray.circles.append(self.circleData)
-		# 		circle_to_draw.append([x,y,r])
-		# 	self.circle_pub.publish(self.circleArray)
-		# 	self.circleArray = circles()
-		# 	#self.rate.sleep()
-		# if self.display:
-		# 	self.draw_circle(img,circle_to_draw)
 
 if __name__ == '__main__':
-	rospy.init_node('number_counter')
-	detector = Circle_Detector('ball_coord')
+	rospy.init_node('ball_detector_node')
+	detector = BallDetector()
 	detector.detection('/webcam/image_raw', display=True)
 	rospy.spin()
